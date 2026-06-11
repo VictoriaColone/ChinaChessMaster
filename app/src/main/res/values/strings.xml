@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ChinaChessMaster</string>
+    <string name="accessibility_service_description">象棋大师自动落子服务，用于在自动模式下模拟屏幕点击完成落子操作。</string>
+</resources>

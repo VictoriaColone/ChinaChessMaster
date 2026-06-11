@@ -1,0 +1,23 @@
+{
+  "current_model": "deepseek-v4-flash",
+  "models": {
+    "deepseek-v4-flash": {
+      "name": "DeepSeek V4 Flash",
+      "base_url": "https://api.deepseek.com/v1/chat/completions",
+      "api_key": "sk-8762e64f76d9422db22937f67023cc90",
+      "model_id": "deepseek-chat",
+      "max_tokens": 1024,
+      "temperature": 0.3,
+      "supports_vision": false
+    },
+    "deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro",
+      "base_url": "https://api.deepseek.com/v1/chat/completions",
+      "api_key": "sk-8762e64f76d9422db22937f67023cc90",
+      "model_id": "deepseek-reasoner",
+      "max_tokens": 2048,
+      "temperature": 0.2,
+      "supports_vision": false
+    }
+  }
+}
