@@ -41,14 +41,34 @@ class ChessBoardAnalyzer(context: Context) {
         }
         Log.d(TAG, "Board region: $boardRegion")
 
-        // 2. 裁剪棋盘区域
+        // 2. 裁剪棋盘区域（粗裁剪，基于背景色）
         val boardWidth = boardRegion.right - boardRegion.left
         val boardHeight = boardRegion.bottom - boardRegion.top
         val boardBitmap = Bitmap.createBitmap(
             screenshot, boardRegion.left, boardRegion.top, boardWidth, boardHeight
         )
 
-        // 3. YOLOX 检测棋子
+        // 2.1 精确定位棋盘格线边界，消除背景色边缘的误差
+        val preciseRegion = findPreciseBoardBoundary(boardBitmap)
+        val gridOffsetX: Int
+        val gridOffsetY: Int
+        val gridWidth: Int
+        val gridHeight: Int
+        if (preciseRegion != null) {
+            gridOffsetX = preciseRegion.left
+            gridOffsetY = preciseRegion.top
+            gridWidth = preciseRegion.right - preciseRegion.left
+            gridHeight = preciseRegion.bottom - preciseRegion.top
+            Log.d(TAG, "Precise grid boundary: offset=($gridOffsetX,$gridOffsetY) size=${gridWidth}x${gridHeight}")
+        } else {
+            gridOffsetX = 0
+            gridOffsetY = 0
+            gridWidth = boardWidth
+            gridHeight = boardHeight
+            Log.d(TAG, "Failed to find precise board boundary, using original crop")
+        }
+
+        // 3. YOLOX 检测棋子（在粗裁剪的 bitmap 上检测）
         val detections = detector.detect(boardBitmap)
         Log.d(TAG, "YOLOX detected ${detections.size} pieces")
 
@@ -59,19 +79,28 @@ class ChessBoardAnalyzer(context: Context) {
         }
 
         // 4. 将检测结果映射到棋盘坐标 + 颜色分析
-        val cellWidth = boardWidth / 8.0
-        val cellHeight = boardHeight / 9.0
+        // 使用精确格线边界计算格子大小，确保坐标映射准确
+        val cellWidth = gridWidth / 8.0
+        val cellHeight = gridHeight / 9.0
         val pieces = mutableListOf<RecognizedPiece>()
 
         for (det in detections) {
-            val centerX = ((det.bbox.left + det.bbox.right) / 2f).toInt()
-            val centerY = ((det.bbox.top + det.bbox.bottom) / 2f).toInt()
+            // 棋子中心点（在粗裁剪坐标系中）
+            val rawCenterX = ((det.bbox.left + det.bbox.right) / 2f).toInt()
+            val rawCenterY = ((det.bbox.top + det.bbox.bottom) / 2f).toInt()
 
-            val col = ((centerX / cellWidth).toInt()).coerceIn(0, 8)
-            val row = 9 - ((centerY / cellHeight).toInt()).coerceIn(0, 9)
+            // 减去格线偏移，转换到以格线左下角为原点的坐标系
+            val gridX = rawCenterX - gridOffsetX
+            val gridY = rawCenterY - gridOffsetY
+
+            // 使用四舍五入映射到最近的格点，比截断更准确
+            val col = Math.round(gridX / cellWidth).toInt().coerceIn(0, 8)
+            val row = 9 - Math.round(gridY / cellHeight).toInt().coerceIn(0, 9)
 
             // 颜色分析区分红黑方
-            val color = detectPieceColor(boardBitmap, centerX, centerY)
+            val clampedX = rawCenterX.coerceIn(0, boardBitmap.width - 1)
+            val clampedY = rawCenterY.coerceIn(0, boardBitmap.height - 1)
+            val color = detectPieceColor(boardBitmap, clampedX, clampedY)
 
             // 根据颜色获取对应的棋子名称
             val namesPair = PIECE_NAME_MAP[det.className]
@@ -206,6 +235,100 @@ class ChessBoardAnalyzer(context: Context) {
 
         if (leftBound == -1 || rightBound - leftBound < width / 3) return null
         return BoardRegion(leftBound, topBound, rightBound, bottomBound)
+    }
+
+    /**
+     * 在粗裁剪的棋盘 bitmap 中精确定位格线边界
+     * 通过检测深色格线来找到棋盘的实际起始/结束位置
+     */
+    private fun findPreciseBoardBoundary(bitmap: Bitmap): BoardRegion? {
+        val width = bitmap.width
+        val height = bitmap.height
+        val scanStep = 2
+
+        // 从上往下扫描，找到第一条水平格线
+        var topBound = -1
+        for (y in 0 until height / 3) {
+            var linePixelCount = 0
+            val scanWidth = width * 3 / 4 - width / 4
+            for (x in width / 4 until width * 3 / 4 step scanStep) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) {
+                    linePixelCount++
+                }
+            }
+            // 水平格线应横跨棋盘中部大部分区域
+            if (linePixelCount > scanWidth / scanStep / 4) {
+                topBound = y
+                break
+            }
+        }
+        if (topBound == -1) return null
+
+        // 从下往上扫描，找到最后一条水平格线
+        var bottomBound = -1
+        for (y in height - 1 downTo height * 2 / 3) {
+            var linePixelCount = 0
+            val scanWidth = width * 3 / 4 - width / 4
+            for (x in width / 4 until width * 3 / 4 step scanStep) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) {
+                    linePixelCount++
+                }
+            }
+            if (linePixelCount > scanWidth / scanStep / 4) {
+                bottomBound = y
+                break
+            }
+        }
+        if (bottomBound == -1) return null
+
+        // 逐行扫描找每行中第一个和最后一个深色像素的 x 坐标，取中位数作为左右边界
+        val verticalScanTop = topBound + (bottomBound - topBound) / 4
+        val verticalScanBottom = bottomBound - (bottomBound - topBound) / 4
+
+        val leftCandidates = mutableListOf<Int>()
+        val rightCandidates = mutableListOf<Int>()
+
+        for (y in verticalScanTop until verticalScanBottom step scanStep) {
+            // 从左往右找第一个深色像素
+            for (x in 0 until width / 3) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) {
+                    leftCandidates.add(x)
+                    break
+                }
+            }
+            // 从右往左找最后一个深色像素
+            for (x in width - 1 downTo width * 2 / 3) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) {
+                    rightCandidates.add(x)
+                    break
+                }
+            }
+        }
+
+        if (leftCandidates.isEmpty() || rightCandidates.isEmpty()) return null
+
+        // 取中位数，过滤掉异常值
+        leftCandidates.sort()
+        rightCandidates.sort()
+        val leftBound = leftCandidates[leftCandidates.size / 2]
+        val rightBound = rightCandidates[rightCandidates.size / 2]
+
+        // 合理性检查：精确边界应在粗裁剪范围内且面积合理
+        if (rightBound - leftBound < width / 2 || bottomBound - topBound < height / 2) {
+            return null
+        }
+
+        return BoardRegion(leftBound, topBound, rightBound, bottomBound)
+    }
+
+    /**
+     * 判断像素是否为棋盘格线颜色（深色线条：黑色或深棕色）
+     */
+    private fun isGridLineColor(pixel: Int): Boolean {
+        val r = Color.red(pixel)
+        val g = Color.green(pixel)
+        val b = Color.blue(pixel)
+        return r < 120 && g < 120 && b < 120
     }
 
     private fun isBoardColor(pixel: Int): Boolean {
