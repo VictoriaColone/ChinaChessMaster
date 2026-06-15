@@ -41,15 +41,22 @@ class LlmApiClient(private val context: Context) {
 
     private val systemPrompt = """你是中国象棋大师。用户会给你当前棋盘上所有棋子的位置信息。
 
-坐标系：列0-8（从左到右），行0-9（行0为红方底线，行9为黑方底线）。
+坐标系：列0-8从左到右，行0为红方底线，行9为黑方底线。红方在下（行0-4），黑方在上（行5-9）。
 
 请根据棋盘局面分析并给出最佳落子方案。
 
 严格按以下JSON格式回复，不要用markdown包裹，不要添加任何多余文字：
 - 棋局已结束: {"over":true}
-- 需要落子: {"over":false,"move":"起始列,起始行->目标列,目标行","desc":"简短说明走法意图"}
+- 需要落子: {"over":false,"move":"起始列,起始行->目标列,目标行","piece":"颜色+棋子名，如：红車、黑炮","notation":"标准象棋术语，如：红車二进三、黑炮８平５"}
 
-move中使用棋盘坐标数字。desc用中文简短说明。"""
+字段说明：
+- move：使用棋盘坐标数字，格式固定为 "列,行->列,行"
+- piece：明确指出是哪一方的哪个棋子，格式为"红/黑+棋子名"，例如"红車"、"黑炮"、"红兵"
+- notation：严格遵循中国象棋标准记谱法，格式为"{颜色}{棋子}{起始列}{动作}{步数或目标列}"
+  * 列号：红方用一二三四五六七八九（从右到左），黑方用１２３４５６７８９（从左到右）
+  * 动作：进（向对方方向）、退（向己方方向）、平（横向移动）
+  * 步数/目标列：进退用步数，平移用目标列号
+  * 示例：红車二进三、黑炮８平５、红马三进四、黑将５平４"""
 
     /**
      * 发送棋盘描述文本给大模型，获取最佳落子方案
@@ -122,11 +129,19 @@ move中使用棋盘坐标数字。desc用中文简短说明。"""
             }
 
             val moveStr = json.get("move")?.asString ?: ""
-            val description = json.get("desc")?.asString ?: ""
+            val piece = json.get("piece")?.asString ?: ""
+            val notation = json.get("notation")?.asString ?: ""
             val move = ChessMove.deserialize(moveStr)
 
+            // 优先用标准记谱，兜底用 piece + 坐标
+            val displayText = when {
+                notation.isNotBlank() -> notation
+                piece.isNotBlank() -> "$piece (${move?.fromCol},${move?.fromRow})→(${move?.toCol},${move?.toRow})"
+                else -> ""
+            }
+
             AnalysisResult(
-                bestMove = move?.copy(description = description),
+                bestMove = move?.copy(description = displayText),
                 isGameOver = false,
                 isUserTurn = true,
                 confidence = 0.9f,

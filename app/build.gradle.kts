@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.ximao.chinachessmaster"
-    compileSdk = 36
+    compileSdk = 33
 
     defaultConfig {
         applicationId = "com.ximao.chinachessmaster"
         minSdk = 24
-        targetSdk = 35
+        targetSdk = 33
         versionCode = 1
         versionName = "1.0"
 

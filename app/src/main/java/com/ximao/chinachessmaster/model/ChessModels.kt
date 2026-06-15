@@ -92,7 +92,7 @@ data class ChessBoard(
                     val segments = token.split("-")
                     if (segments.size != 4) return@mapNotNull null
                     val color = if (segments[0] == "R") PieceColor.RED else PieceColor.BLACK
-                    val type = PieceType.entries.find { it.symbol == segments[1] } ?: return@mapNotNull null
+                    val type = PieceType.values().find { it.symbol == segments[1] } ?: return@mapNotNull null
                     val col = segments[2].toIntOrNull() ?: return@mapNotNull null
                     val row = segments[3].toIntOrNull() ?: return@mapNotNull null
                     ChessPiece(type, color, col, row)
