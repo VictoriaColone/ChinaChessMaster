@@ -79,9 +79,21 @@ class ChessBoardAnalyzer(context: Context) {
         }
 
         // 4. 将检测结果映射到棋盘坐标 + 颜色分析
-        // 使用精确格线边界计算格子大小，确保坐标映射准确
+        //
+        // 坐标映射原理：
+        //   棋盘有 9 列、10 行格点，格点之间有 8 列间隔、9 行间隔
+        //   gridWidth  = 8 个列间隔的总宽，cellWidth  = gridWidth  / 8
+        //   gridHeight = 9 个行间隔的总高，cellHeight = gridHeight / 9
+        //
+        //   格线检测得到的 topBound/bottomBound 是格线像素位置，
+        //   格线本身有 2~4px 宽度，真实格点中心在像素范围中央。
+        //   为避免底线/顶线棋子因格线像素宽度导致的系统性偏移，
+        //   映射时对 gridY 加半格补偿，使格点区间中心对齐。
         val cellWidth = gridWidth / 8.0
         val cellHeight = gridHeight / 9.0
+        // 半格偏移补偿：让每个格点区间从 [n*cell - cell/2, n*cell + cell/2]，
+        // 这样底线棋子的 gridY ≈ gridHeight 时能正确映射到格点 9（row=0）
+        val halfCell = (cellHeight / 2.0).toInt()
         val pieces = mutableListOf<RecognizedPiece>()
 
         for (det in detections) {
@@ -89,13 +101,14 @@ class ChessBoardAnalyzer(context: Context) {
             val rawCenterX = ((det.bbox.left + det.bbox.right) / 2f).toInt()
             val rawCenterY = ((det.bbox.top + det.bbox.bottom) / 2f).toInt()
 
-            // 减去格线偏移，转换到以格线左下角为原点的坐标系
+            // 减去格线偏移，转换到以第一条格线为原点的坐标系
             val gridX = rawCenterX - gridOffsetX
-            val gridY = rawCenterY - gridOffsetY
+            // Y 轴加半格偏移：补偿格线宽度导致的系统性向上偏移
+            val gridY = (rawCenterY - gridOffsetY) + halfCell
 
-            // 使用四舍五入映射到最近的格点，比截断更准确
+            // 整除（截断）映射：gridY 已加半格，截断等价于四舍五入到最近格点
             val col = Math.round(gridX / cellWidth).toInt().coerceIn(0, 8)
-            val row = 9 - Math.round(gridY / cellHeight).toInt().coerceIn(0, 9)
+            val row = 9 - (gridY / cellHeight).toInt().coerceIn(0, 9)
 
             // 颜色分析区分红黑方
             val clampedX = rawCenterX.coerceIn(0, boardBitmap.width - 1)
