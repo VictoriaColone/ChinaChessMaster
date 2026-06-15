@@ -120,9 +120,15 @@ class ChessBoardAnalyzer(context: Context) {
         val description = generateBoardDescription(pieces)
         Log.d(TAG, "Board description:\n$description")
 
+        // 6. 生成 FEN（供 Pikafish 引擎使用）
+        val fen = generateFen(pieces)
+        Log.d(TAG, "FEN: $fen")
+
         return BoardAnalysisResult(
             found = true,
             description = description,
+            fen = fen,
+            recognizedPieces = pieces,
             pieceCount = pieces.size
         )
     }
@@ -182,6 +188,73 @@ class ChessBoardAnalyzer(context: Context) {
         sb.appendLine("坐标系说明：列0-8从左到右，行0为红方底线，行9为黑方底线。")
 
         return sb.toString()
+    }
+
+    /**
+     * 将识别到的棋子列表转换为象棋 FEN 字符串
+     *
+     * FEN 坐标系：行 0（最顶行/黑方底线） → 行 9（最底行/红方底线）
+     * 我们的坐标系：row=0 是红方底线，row=9 是黑方底线
+     * 因此 FEN 行索引 = 9 - row
+     *
+     * FEN 棋子字母：大写=红方，小写=黑方
+     *   K=帅  A=仕  B=相  N=馬  R=車  C=炮  P=兵
+     *   k=将  a=士  b=象  n=馬  r=車  c=砲  p=卒
+     */
+    private fun generateFen(pieces: List<RecognizedPiece>): String {
+        // 建立 10行×9列 的棋盘格，null 表示空格
+        val board = Array(10) { arrayOfNulls<String>(9) }
+        for (piece in pieces) {
+            val fenRow = 9 - piece.row  // 转换到 FEN 行索引
+            val col = piece.col
+            if (fenRow in 0..9 && col in 0..8) {
+                board[fenRow][col] = pieceToFenChar(piece.name, piece.color)
+            }
+        }
+
+        // 将棋盘序列化为 FEN rank 字符串
+        val ranks = board.map { row ->
+            val sb = StringBuilder()
+            var emptyCount = 0
+            for (cell in row) {
+                if (cell == null) {
+                    emptyCount++
+                } else {
+                    if (emptyCount > 0) {
+                        sb.append(emptyCount)
+                        emptyCount = 0
+                    }
+                    sb.append(cell)
+                }
+            }
+            if (emptyCount > 0) sb.append(emptyCount)
+            sb.toString()
+        }
+
+        // 根据将帅位置判断谁先走：
+        // 帅（K）在屏幕下方（内部 row=0，即 FEN 第9行）→ 红方先手（w）
+        // 将（k）在屏幕下方（内部 row=0，即 FEN 第9行）→ 黑方先手（b）
+        val redKingAtBottom = pieces.any { it.name == "帅" && it.row <= 2 }
+        val sideToMove = if (redKingAtBottom) "w" else "b"
+        return ranks.joinToString("/") + " $sideToMove - - 0 1"
+    }
+
+    /**
+     * 将棋子名称和颜色转换为 FEN 字符（大写=红方，小写=黑方）
+     */
+    private fun pieceToFenChar(name: String, color: String): String {
+        val isRed = color == "红"
+        val char = when (name) {
+            "帅", "将" -> "K"
+            "仕", "士" -> "A"
+            "相", "象" -> "B"
+            "車" -> "R"
+            "馬" -> "N"
+            "炮", "砲" -> "C"
+            "兵", "卒" -> "P"
+            else -> "?"
+        }
+        return if (isRed) char else char.lowercase()
     }
 
     /**
@@ -353,6 +426,8 @@ data class RecognizedPiece(
 data class BoardAnalysisResult(
     val found: Boolean,
     val description: String = "",
+    val fen: String = "",
+    val recognizedPieces: List<RecognizedPiece> = emptyList(),
     val pieceCount: Int = 0
 )
 

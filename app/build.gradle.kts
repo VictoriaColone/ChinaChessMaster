@@ -33,6 +33,11 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+
+    packagingOptions {
+        // 强制系统将 .so 文件解压提取到 nativeLibraryDir，使其可被执行
+        jniLibs.useLegacyPackaging = true
+    }
 }
 
 dependencies {

@@ -1,0 +1,256 @@
+package com.ximao.chinachessmaster.engine
+
+import android.content.Context
+import android.os.Build
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import java.io.PrintWriter
+
+/**
+ * Pikafish UCI 象棋引擎封装
+ *
+ * Android SELinux 不允许 app 直接 exec 自己写入的文件（filesDir），
+ * 但允许通过 `/system/bin/sh` 中转执行 nativeLibraryDir 的文件：
+ *   ProcessBuilder("sh", "-c", enginePath) → 由 shell fork，引擎正常运行
+ *
+ * 引擎：libpikafish.so 打包进 jniLibs，系统安装到 nativeLibraryDir（有执行权限）
+ * NNUE 模型：打包进 assets，首次运行时复制到 filesDir
+ *
+ * UCI 通信流程：
+ *   uci → uciok → setoption EvalFile → isready → readyok
+ *   position fen <FEN> → go movetime <ms> → bestmove <move>
+ */
+class PikafishEngine(private val context: Context) {
+
+    companion object {
+        private const val TAG = "PikafishEngine"
+        private const val ASSET_DIR = "pikafish"
+        private const val NNUE_FILE = "pikafish.nnue"
+        private const val ENGINE_SO_NAME = "libpikafish.so"
+        private const val INIT_TIMEOUT_MS = 15_000L
+    }
+
+    private var engineProcess: Process? = null
+    private var uciWriter: PrintWriter? = null
+    private var uciReader: BufferedReader? = null
+    private var isReady = false
+    private var hasSearched = false  // 是否已经完成过至少一次搜索，用于决定是否发 stop
+    private val searchMutex = Mutex()  // 保证同一时刻只有一个搜索请求
+
+    // 引擎二进制：系统安装到 nativeLibraryDir，有执行权限
+    private val nativeLibDir: File by lazy { File(context.applicationInfo.nativeLibraryDir) }
+
+    // NNUE 模型：从 assets 复制到 filesDir
+    private val nnueDir: File by lazy { File(context.filesDir, ASSET_DIR) }
+
+    /**
+     * 初始化引擎：
+     *   1. 从 assets 复制 NNUE 模型到 filesDir（首次，51MB，后续跳过）
+     *   2. 找到 nativeLibraryDir 中的 libpikafish.so
+     *   3. 通过 sh 中转启动引擎子进程，完成 UCI 握手
+     *
+     * 为什么用 sh 中转：Java ProcessBuilder 直接 exec 静态链接 ELF 可执行文件时
+     * 在 Android 上会 SIGSEGV（exit 139），由 shell fork 执行则正常。
+     * @return true 表示引擎就绪
+     */
+    suspend fun init(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            copyNnueIfNeeded()
+
+            val engineFile = File(nativeLibDir, ENGINE_SO_NAME)
+            if (!engineFile.exists()) {
+                Log.e(TAG, "$ENGINE_SO_NAME not found in ${nativeLibDir.absolutePath}")
+                return@withContext false
+            }
+
+            val nnuePath = File(nnueDir, NNUE_FILE).absolutePath
+            Log.d(TAG, "Starting engine via sh: ${engineFile.absolutePath}")
+            Log.d(TAG, "NNUE path: $nnuePath")
+
+            // 通过 sh 中转 + ulimit -s unlimited 解除栈大小限制，避免 NNUE 大内存分配时 Segfault
+            engineProcess = ProcessBuilder("sh", "-c", "ulimit -s unlimited; ${engineFile.absolutePath}")
+                .directory(nnueDir)
+                .redirectErrorStream(true)
+                .start()
+
+            uciWriter = PrintWriter(engineProcess!!.outputStream, true)
+            uciReader = BufferedReader(InputStreamReader(engineProcess!!.inputStream))
+
+            val handshakeOk = withTimeoutOrNull(INIT_TIMEOUT_MS) {
+                performUciHandshake(nnuePath)
+            } ?: false
+
+            isReady = handshakeOk
+            Log.d(TAG, "Engine init result: $isReady")
+            isReady
+        } catch (e: Exception) {
+            Log.e(TAG, "Engine init failed", e)
+            false
+        }
+    }
+
+    /**
+     * 给定 FEN 局面，返回最佳走法（ICCS 格式，如 "h2e2"）
+     *
+     * 每次搜索前先发 "stop" 中断可能存在的 ponder 状态，
+     * 再发 "position" 和 "go"，避免引擎处于非就绪状态时收到命令导致输出混乱。
+     *
+     * @param fen 标准 FEN 字符串
+     * @param moveTimeMs 搜索时限（毫秒）
+     * @return 最佳走法字符串，null 表示失败
+     */
+    suspend fun getBestMove(fen: String, moveTimeMs: Int = 3000): String? {
+        if (!isReady) {
+            Log.w(TAG, "Engine not ready")
+            return null
+        }
+        return searchMutex.withLock {
+            withContext(Dispatchers.IO) {
+                try {
+                    // 只有搜索过至少一次后才发 stop（第一次搜索前发 stop 会干扰引擎初始化状态）
+                    if (hasSearched) {
+                        sendCommand("stop")
+                        drainOutput()
+                    }
+
+                    sendCommand("position fen $fen")
+                    sendCommand("go movetime $moveTimeMs")
+
+                    val bestMove = withTimeoutOrNull((moveTimeMs + 3000).toLong()) {
+                        readUntilBestMove()
+                    }
+
+                    if (bestMove != null) hasSearched = true
+                    Log.d(TAG, "bestmove: $bestMove")
+                    bestMove
+                } catch (e: Exception) {
+                    Log.e(TAG, "getBestMove failed", e)
+                    null
+                }
+            }
+        }
+    }
+
+    /**
+     * 关闭引擎进程
+     */
+    fun close() {
+        try {
+            sendCommand("quit")
+        } catch (_: Exception) {}
+        uciWriter?.close()
+        uciReader?.close()
+        engineProcess?.destroy()
+        engineProcess = null
+        isReady = false
+        Log.d(TAG, "Engine closed")
+    }
+
+    // ───────────────────────── 私有方法 ─────────────────────────
+
+    /**
+     * 从 assets 复制 NNUE 模型到 filesDir（51MB，存在且大小正常则跳过）
+     */
+    private fun copyNnueIfNeeded() {
+        nnueDir.mkdirs()
+        val target = File(nnueDir, NNUE_FILE)
+        if (target.exists() && target.length() > 1024 * 1024) {
+            Log.d(TAG, "NNUE already exists (${target.length() / 1024 / 1024}MB), skipping")
+            return
+        }
+        Log.d(TAG, "Copying NNUE model from assets...")
+        context.assets.open("$ASSET_DIR/$NNUE_FILE").use { input ->
+            target.outputStream().use { output ->
+                input.copyTo(output, bufferSize = 512 * 1024)
+            }
+        }
+        Log.d(TAG, "NNUE copy complete: ${target.length() / 1024 / 1024}MB")
+    }
+
+    /**
+     * UCI 握手：uci → setoption → isready → readyok
+     */
+    private fun performUciHandshake(nnuePath: String): Boolean {
+        sendCommand("uci")
+        if (!readUntil("uciok")) {
+            Log.e(TAG, "Did not receive uciok")
+            return false
+        }
+
+        sendCommand("setoption name EvalFile value $nnuePath")
+        sendCommand("setoption name NumaPolicy value none")  // 禁用 NUMA/共享内存，避免 Android SELinux 下 Segfault
+        sendCommand("setoption name Threads value 2")
+        sendCommand("setoption name Hash value 32")
+        sendCommand("isready")
+
+        if (!readUntil("readyok")) {
+            Log.e(TAG, "Did not receive readyok")
+            return false
+        }
+
+        Log.d(TAG, "UCI handshake complete")
+        return true
+    }
+
+    private fun sendCommand(command: String) {
+        Log.v(TAG, ">>> $command")
+        uciWriter?.println(command)
+    }
+
+    /**
+     * 持续读取引擎输出，直到某一行包含目标关键词
+     */
+    private fun readUntil(keyword: String): Boolean {
+        val reader = uciReader ?: return false
+        repeat(200) {
+            val line = reader.readLine() ?: return false
+            Log.v(TAG, "<<< $line")
+            if (line.contains(keyword)) return true
+        }
+        return false
+    }
+
+    /**
+     * 读取引擎输出，直到获取 "bestmove" 行。
+     * readLine() 阻塞等待下一行，返回 null 仅当流关闭（引擎进程退出）时。
+     * @return bestmove 后面的走法字符串（如 "h2e2"），"(none)" 视为 null
+     */
+    private fun readUntilBestMove(): String? {
+        val reader = uciReader ?: return null
+        while (true) {
+            val line = reader.readLine() ?: run {
+                val exitCode = try { engineProcess?.exitValue() } catch (_: IllegalThreadStateException) { null }
+                Log.e(TAG, "Engine stdout closed. Process exit code: $exitCode")
+                isReady = false
+                return null
+            }
+            Log.v(TAG, "<<< $line")
+            if (line.startsWith("bestmove")) {
+                val move = line.split(" ").getOrNull(1)
+                return if (move == null || move == "(none)") null else move
+            }
+        }
+    }
+
+    /**
+     * 清空引擎输出流中的残留数据（如上一次搜索的 info 行或 ponder bestmove）
+     * 利用 ready() 判断是否有数据，避免阻塞
+     */
+    private fun drainOutput() {
+        val reader = uciReader ?: return
+        var drained = 0
+        while (reader.ready()) {
+            val line = reader.readLine() ?: break
+            Log.v(TAG, "drain<<< $line")
+            drained++
+        }
+        if (drained > 0) Log.d(TAG, "Drained $drained lines from engine output buffer")
+    }
+}
