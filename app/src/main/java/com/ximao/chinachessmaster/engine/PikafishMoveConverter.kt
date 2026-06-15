@@ -120,24 +120,35 @@ object PikafishMoveConverter {
             blackColumnLabel(fromCol) // 黑方：从左到右，１２３...
         }
 
-        // 计算动作和步数
+        // 马、象、仕走斜线，记谱末尾是"目标列号"；車炮兵/卒走直线，末尾是"步数"
+        val usesTargetCol = pieceName in setOf("馬", "相", "象", "仕", "士")
+
+        // 计算动作和末尾数字
         val (action, steps) = when {
             fromRow == toRow -> {
-                // 平移
+                // 平移（只有車炮才会平移，末尾直接用目标列号）
                 val targetColLabel = if (piece.isRed) redColumnLabel(toCol) else blackColumnLabel(toCol)
                 Pair("平", targetColLabel)
             }
             piece.isRed -> {
-                // 红方在底线（row=0），向上进攻 row 增大 = 进，row 减小 = 退
-                val stepCount = Math.abs(toRow - fromRow)
-                if (toRow > fromRow) Pair("进", stepCount.toString())
-                else Pair("退", stepCount.toString())
+                // 红方在底线（row=0），row 增大 = 进，row 减小 = 退
+                val suffix = if (usesTargetCol) {
+                    redColumnLabel(toCol)           // 马/象/仕：目标列号
+                } else {
+                    Math.abs(toRow - fromRow).toString()  // 車/炮/兵：行步数
+                }
+                if (toRow > fromRow) Pair("进", suffix)
+                else Pair("退", suffix)
             }
             else -> {
-                // 黑方在顶线（row=9），向下进攻 row 减小 = 进，row 增大 = 退
-                val stepCount = Math.abs(toRow - fromRow)
-                if (toRow < fromRow) Pair("进", stepCount.toString())
-                else Pair("退", stepCount.toString())
+                // 黑方在顶线（row=9），row 减小 = 进，row 增大 = 退
+                val suffix = if (usesTargetCol) {
+                    blackColumnLabel(toCol)         // 马/象/仕：目标列号
+                } else {
+                    Math.abs(toRow - fromRow).toString()  // 車/炮/卒：行步数
+                }
+                if (toRow < fromRow) Pair("进", suffix)
+                else Pair("退", suffix)
             }
         }
 

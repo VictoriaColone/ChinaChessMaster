@@ -40,9 +40,11 @@ class PikafishEngine(private val context: Context) {
     private var engineProcess: Process? = null
     private var uciWriter: PrintWriter? = null
     private var uciReader: BufferedReader? = null
-    private var isReady = false
+    var isReady = false
+        private set
     private var hasSearched = false  // 是否已经完成过至少一次搜索，用于决定是否发 stop
     private val searchMutex = Mutex()  // 保证同一时刻只有一个搜索请求
+    private var engineFilePath: String = ""  // 缓存引擎路径，供崩溃重启使用
 
     // 引擎二进制：系统安装到 nativeLibraryDir，有执行权限
     private val nativeLibDir: File by lazy { File(context.applicationInfo.nativeLibraryDir) }
@@ -70,24 +72,13 @@ class PikafishEngine(private val context: Context) {
                 return@withContext false
             }
 
+            engineFilePath = engineFile.absolutePath
             val nnuePath = File(nnueDir, NNUE_FILE).absolutePath
-            Log.d(TAG, "Starting engine via sh: ${engineFile.absolutePath}")
+            Log.d(TAG, "Starting engine via sh: $engineFilePath")
             Log.d(TAG, "NNUE path: $nnuePath")
 
-            // 通过 sh 中转 + ulimit -s unlimited 解除栈大小限制，避免 NNUE 大内存分配时 Segfault
-            engineProcess = ProcessBuilder("sh", "-c", "ulimit -s unlimited; ${engineFile.absolutePath}")
-                .directory(nnueDir)
-                .redirectErrorStream(true)
-                .start()
-
-            uciWriter = PrintWriter(engineProcess!!.outputStream, true)
-            uciReader = BufferedReader(InputStreamReader(engineProcess!!.inputStream))
-
-            val handshakeOk = withTimeoutOrNull(INIT_TIMEOUT_MS) {
-                performUciHandshake(nnuePath)
-            } ?: false
-
-            isReady = handshakeOk
+            val started = startEngineProcess(engineFilePath, nnuePath)
+            isReady = started
             Log.d(TAG, "Engine init result: $isReady")
             isReady
         } catch (e: Exception) {
@@ -123,8 +114,8 @@ class PikafishEngine(private val context: Context) {
                     sendCommand("position fen $fen")
                     sendCommand("go movetime $moveTimeMs")
 
-                    val bestMove = withTimeoutOrNull((moveTimeMs + 3000).toLong()) {
-                        readUntilBestMove()
+                    val bestMove = withTimeoutOrNull((moveTimeMs + 6000).toLong()) {
+                        readUntilBestMoveWithRetry(fen, moveTimeMs)
                     }
 
                     if (bestMove != null) hasSearched = true
@@ -154,6 +145,52 @@ class PikafishEngine(private val context: Context) {
     }
 
     // ───────────────────────── 私有方法 ─────────────────────────
+
+    /**
+     * 启动引擎子进程并完成 UCI 握手，成功返回 true
+     */
+    private fun startEngineProcess(enginePath: String, nnuePath: String): Boolean {
+        try {
+            engineProcess?.destroy()
+            engineProcess = null
+            uciWriter?.close()
+            uciReader?.close()
+
+            // sh 中转 + ulimit -s unlimited 解除栈限制，避免 NNUE 64MB 分配时 Segfault
+            engineProcess = ProcessBuilder("sh", "-c", "ulimit -s unlimited; $enginePath")
+                .directory(nnueDir)
+                .redirectErrorStream(true)
+                .start()
+
+            uciWriter = PrintWriter(engineProcess!!.outputStream, true)
+            uciReader = BufferedReader(InputStreamReader(engineProcess!!.inputStream))
+            hasSearched = false
+
+            return performUciHandshake(nnuePath)
+        } catch (e: Exception) {
+            Log.e(TAG, "startEngineProcess failed", e)
+            return false
+        }
+    }
+
+    /**
+     * 引擎崩溃后尝试重启，最多重试 2 次
+     */
+    private fun tryRestartEngine(): Boolean {
+        val nnuePath = File(nnueDir, NNUE_FILE).absolutePath
+        if (engineFilePath.isEmpty()) return false
+        repeat(2) { attempt ->
+            Log.w(TAG, "Restarting engine (attempt ${attempt + 1})...")
+            if (startEngineProcess(engineFilePath, nnuePath)) {
+                isReady = true
+                Log.d(TAG, "Engine restarted successfully")
+                return true
+            }
+        }
+        Log.e(TAG, "Engine restart failed after 2 attempts")
+        isReady = false
+        return false
+    }
 
     /**
      * 从 assets 复制 NNUE 模型到 filesDir（51MB，存在且大小正常则跳过）
@@ -186,8 +223,8 @@ class PikafishEngine(private val context: Context) {
 
         sendCommand("setoption name EvalFile value $nnuePath")
         sendCommand("setoption name NumaPolicy value none")  // 禁用 NUMA/共享内存，避免 Android SELinux 下 Segfault
-        sendCommand("setoption name Threads value 2")
-        sendCommand("setoption name Hash value 32")
+        sendCommand("setoption name Threads value 1")        // 单线程，彻底消除多线程 NNUE 内存竞争导致的 Segfault
+        sendCommand("setoption name Hash value 16")
         sendCommand("isready")
 
         if (!readUntil("readyok")) {
@@ -196,6 +233,15 @@ class PikafishEngine(private val context: Context) {
         }
 
         Log.d(TAG, "UCI handshake complete")
+
+        // 预热：发一次快速搜索，让引擎在初始化阶段完成 NNUE 推理工作区的内存分配。
+        // 不预热时，第一次真正搜索（go movetime 3000）会触发 64MB mmap，概率 Segfault。
+        Log.d(TAG, "Warming up engine...")
+        sendCommand("position startpos")
+        sendCommand("go movetime 100")
+        readUntil("bestmove")
+        Log.d(TAG, "Engine warmup complete")
+
         return true
     }
 
@@ -237,6 +283,23 @@ class PikafishEngine(private val context: Context) {
                 return if (move == null || move == "(none)") null else move
             }
         }
+    }
+
+    /**
+     * 带自动重启的 bestmove 获取：引擎崩溃后重启并重试一次
+     */
+    private fun readUntilBestMoveWithRetry(fen: String, moveTimeMs: Int): String? {
+        val firstResult = readUntilBestMove()
+        if (firstResult != null) return firstResult
+
+        // 引擎崩溃（isReady = false），尝试重启并重试
+        Log.w(TAG, "Engine crashed, attempting restart and retry...")
+        if (!tryRestartEngine()) return null
+
+        // 重启成功，重新发送搜索命令
+        sendCommand("position fen $fen")
+        sendCommand("go movetime $moveTimeMs")
+        return readUntilBestMove()
     }
 
     /**

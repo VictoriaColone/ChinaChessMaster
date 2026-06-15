@@ -82,9 +82,24 @@ class ChessMasterController(private val context: Context) {
                 // Step 2: 优先使用 Pikafish 引擎
                 val bestMove = if (engineInitialized && boardResult.fen.isNotEmpty()) {
                     Log.d(TAG, "Step 2: Using Pikafish engine...")
-                    tryPikafishMove(boardResult.fen)
+                    val move = tryPikafishMove(boardResult.fen)
+                    // 引擎崩溃后（返回 null 且 isReady=false），后台异步重启，下次调用恢复
+                    if (move == null && !pikafishEngine.isReady) {
+                        engineInitialized = false
+                        Log.w(TAG, "Engine crashed, scheduling background restart...")
+                        scope.launch(Dispatchers.IO) {
+                            engineInitialized = pikafishEngine.init()
+                            Log.d(TAG, "Engine restarted in background: $engineInitialized")
+                        }
+                    }
+                    move
                 } else {
-                    Log.d(TAG, "Step 2: Engine not ready, skip to fallback")
+                    // 引擎还未就绪（可能正在后台重启），跳过降级
+                    if (!engineInitialized) {
+                        Log.d(TAG, "Step 2: Engine restarting, skip to fallback")
+                    } else {
+                        Log.d(TAG, "Step 2: Engine not ready, skip to fallback")
+                    }
                     null
                 }
 
