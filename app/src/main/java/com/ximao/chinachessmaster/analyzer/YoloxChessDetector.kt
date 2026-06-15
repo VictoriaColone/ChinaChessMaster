@@ -25,7 +25,7 @@ class YoloxChessDetector(context: Context) {
         private const val MODEL_FILE = "chessai-det-light.onnx"
         private const val INPUT_SIZE = 640
         private const val PADDING_VALUE = 114f
-        private const val CONF_THRESHOLD = 0.3f
+        private const val CONF_THRESHOLD = 0.5f
         private const val NMS_THRESHOLD = 0.5f
         private val STRIDES = intArrayOf(8, 16, 32)
         val CLASS_NAMES = arrayOf("r", "n", "b", "a", "k", "c", "p")

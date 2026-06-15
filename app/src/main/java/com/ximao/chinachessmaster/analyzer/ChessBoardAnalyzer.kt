@@ -29,6 +29,13 @@ class ChessBoardAnalyzer(context: Context) {
     private val detector = YoloxChessDetector(context)
 
     /**
+     * 缓存首次成功检测到的精确格线边界。
+     * 棋盘位置在一局棋中固定不变，棋子移动不影响格线位置，
+     * 缓存后复用可消除因棋子深色像素干扰格线检测导致的坐标漂移。
+     */
+    private var cachedPreciseRegion: BoardRegion? = null
+
+    /**
      * 分析截图，返回棋盘文本描述（供大模型分析）
      * @return 棋盘描述文本，found=false 表示未检测到棋盘
      */
@@ -48,8 +55,17 @@ class ChessBoardAnalyzer(context: Context) {
             screenshot, boardRegion.left, boardRegion.top, boardWidth, boardHeight
         )
 
-        // 2.1 精确定位棋盘格线边界，消除背景色边缘的误差
-        val preciseRegion = findPreciseBoardBoundary(boardBitmap)
+        // 2.1 精确定位棋盘格线边界
+        // 优先使用缓存值：棋盘位置固定，棋子移动不影响格线，避免每次重检测时
+        // 棋子深色像素干扰左右边界扫描导致的坐标系统性漂移
+        if (cachedPreciseRegion == null) {
+            val detected = findPreciseBoardBoundary(boardBitmap)
+            if (detected != null) {
+                cachedPreciseRegion = detected
+                Log.d(TAG, "Precise grid boundary cached: offset=(${detected.left},${detected.top}) size=${detected.right - detected.left}x${detected.bottom - detected.top}")
+            }
+        }
+        val preciseRegion = cachedPreciseRegion
         val gridOffsetX: Int
         val gridOffsetY: Int
         val gridWidth: Int
@@ -59,7 +75,6 @@ class ChessBoardAnalyzer(context: Context) {
             gridOffsetY = preciseRegion.top
             gridWidth = preciseRegion.right - preciseRegion.left
             gridHeight = preciseRegion.bottom - preciseRegion.top
-            Log.d(TAG, "Precise grid boundary: offset=($gridOffsetX,$gridOffsetY) size=${gridWidth}x${gridHeight}")
         } else {
             gridOffsetX = 0
             gridOffsetY = 0
@@ -79,21 +94,10 @@ class ChessBoardAnalyzer(context: Context) {
         }
 
         // 4. 将检测结果映射到棋盘坐标 + 颜色分析
-        //
-        // 坐标映射原理：
-        //   棋盘有 9 列、10 行格点，格点之间有 8 列间隔、9 行间隔
-        //   gridWidth  = 8 个列间隔的总宽，cellWidth  = gridWidth  / 8
-        //   gridHeight = 9 个行间隔的总高，cellHeight = gridHeight / 9
-        //
-        //   格线检测得到的 topBound/bottomBound 是格线像素位置，
-        //   格线本身有 2~4px 宽度，真实格点中心在像素范围中央。
-        //   为避免底线/顶线棋子因格线像素宽度导致的系统性偏移，
-        //   映射时对 gridY 加半格补偿，使格点区间中心对齐。
+        // 棋盘 9 列格点（8个列间隔），10 行格点（9个行间隔）
+        // gridWidth/gridHeight 是两端格线交叉点之间的距离
         val cellWidth = gridWidth / 8.0
         val cellHeight = gridHeight / 9.0
-        // 半格偏移补偿：让每个格点区间从 [n*cell - cell/2, n*cell + cell/2]，
-        // 这样底线棋子的 gridY ≈ gridHeight 时能正确映射到格点 9（row=0）
-        val halfCell = (cellHeight / 2.0).toInt()
         val pieces = mutableListOf<RecognizedPiece>()
 
         for (det in detections) {
@@ -101,14 +105,13 @@ class ChessBoardAnalyzer(context: Context) {
             val rawCenterX = ((det.bbox.left + det.bbox.right) / 2f).toInt()
             val rawCenterY = ((det.bbox.top + det.bbox.bottom) / 2f).toInt()
 
-            // 减去格线偏移，转换到以第一条格线为原点的坐标系
+            // 减去格线偏移，转换到以顶线格点为原点的坐标系
             val gridX = rawCenterX - gridOffsetX
-            // Y 轴加半格偏移：补偿格线宽度导致的系统性向上偏移
-            val gridY = (rawCenterY - gridOffsetY) + halfCell
+            val gridY = rawCenterY - gridOffsetY
 
-            // 整除（截断）映射：gridY 已加半格，截断等价于四舍五入到最近格点
+            // 四舍五入映射到最近的格点
             val col = Math.round(gridX / cellWidth).toInt().coerceIn(0, 8)
-            val row = 9 - (gridY / cellHeight).toInt().coerceIn(0, 9)
+            val row = 9 - Math.round(gridY / cellHeight).toInt().coerceIn(0, 9)
 
             // 颜色分析区分红黑方
             val clampedX = rawCenterX.coerceIn(0, boardBitmap.width - 1)
@@ -129,21 +132,77 @@ class ChessBoardAnalyzer(context: Context) {
 
         boardBitmap.recycle()
 
-        // 5. 生成专业象棋术语描述
-        val description = generateBoardDescription(pieces)
+        // 5. 棋局合法性过滤：去除幻觉误检
+        val filteredPieces = filterIllegalPieces(pieces)
+
+        // 6. 生成专业象棋术语描述
+        val description = generateBoardDescription(filteredPieces)
         Log.d(TAG, "Board description:\n$description")
 
-        // 6. 生成 FEN（供 Pikafish 引擎使用）
-        val fen = generateFen(pieces)
+        // 7. 生成 FEN（供 Pikafish 引擎使用）
+        val fen = generateFen(filteredPieces)
         Log.d(TAG, "FEN: $fen")
 
         return BoardAnalysisResult(
             found = true,
             description = description,
             fen = fen,
-            recognizedPieces = pieces,
-            pieceCount = pieces.size
+            recognizedPieces = filteredPieces,
+            pieceCount = filteredPieces.size
         )
+    }
+
+    /**
+     * 棋局合法性过滤：去除 YOLOX 因棋子移动产生的幻觉误检。
+     *
+     * 规则1 - 同格去重：同一格内只保留置信度最高的棋子。
+     * 规则2 - 数量上限：每类棋子不超过合法数量，超出部分删最低置信度的。
+     *
+     * 注意：RecognizedPiece 本身不含 confidence，这里借助检测顺序（YOLOX 已按置信度降序输出）
+     * 直接用 List 的先后顺序作为置信度排名（靠前 = 置信度高）。
+     */
+    private fun filterIllegalPieces(pieces: List<RecognizedPiece>): List<RecognizedPiece> {
+        // 各棋子合法数量上限（红方/黑方各自）
+        val maxCount = mapOf(
+            "帅" to 1, "将" to 1,
+            "仕" to 2, "士" to 2,
+            "相" to 2, "象" to 2,
+            "車" to 2,
+            "馬" to 2,
+            "炮" to 2, "砲" to 2,
+            "兵" to 5, "卒" to 5
+        )
+
+        // 规则1：同格去重，保留靠前（置信度高）的那个
+        val cellOccupied = mutableSetOf<Pair<Int, Int>>()
+        val deduped = mutableListOf<RecognizedPiece>()
+        for (piece in pieces) {
+            val cell = Pair(piece.col, piece.row)
+            if (cell !in cellOccupied) {
+                cellOccupied.add(cell)
+                deduped.add(piece)
+            } else {
+                Log.d(TAG, "Filter: drop duplicate at (${piece.col},${piece.row}) ${piece.color}${piece.name}")
+            }
+        }
+
+        // 规则2：数量上限，按颜色分组，超出则删靠后的（置信度低）
+        val result = mutableListOf<RecognizedPiece>()
+        val countByColorName = mutableMapOf<String, Int>()
+        for (piece in deduped) {
+            val key = "${piece.color}${piece.name}"
+            val current = countByColorName.getOrDefault(key, 0)
+            val limit = maxCount[piece.name] ?: Int.MAX_VALUE
+            if (current < limit) {
+                countByColorName[key] = current + 1
+                result.add(piece)
+            } else {
+                Log.d(TAG, "Filter: drop over-limit ${piece.color}${piece.name} at (${piece.col},${piece.row})")
+            }
+        }
+
+        Log.d(TAG, "Filter: ${pieces.size} -> ${result.size} pieces after legality check")
+        return result
     }
 
     /**
@@ -367,37 +426,36 @@ class ChessBoardAnalyzer(context: Context) {
         }
         if (bottomBound == -1) return null
 
-        // 逐行扫描找每行中第一个和最后一个深色像素的 x 坐标，取中位数作为左右边界
+        // 通过"众数"策略找左右格线边界：
+        // 格线是竖线，在每一行都精确出现在同一列 x，所以该列的命中次数最多（众数）。
+        // 棋子只在局部几行出现，命中次数远少于格线，不会成为众数。
         val verticalScanTop = topBound + (bottomBound - topBound) / 4
         val verticalScanBottom = bottomBound - (bottomBound - topBound) / 4
 
-        val leftCandidates = mutableListOf<Int>()
-        val rightCandidates = mutableListOf<Int>()
+        // 统计左 1/3 区域每列出现深色像素的行数
+        val leftRange = width / 3
+        val leftHits = IntArray(leftRange)
+        // 统计右 1/3 区域每列出现深色像素的行数
+        val rightStart = width * 2 / 3
+        val rightHits = IntArray(width - rightStart)
 
         for (y in verticalScanTop until verticalScanBottom step scanStep) {
-            // 从左往右找第一个深色像素
-            for (x in 0 until width / 3) {
-                if (isGridLineColor(bitmap.getPixel(x, y))) {
-                    leftCandidates.add(x)
-                    break
-                }
+            for (x in 0 until leftRange) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) leftHits[x]++
             }
-            // 从右往左找最后一个深色像素
-            for (x in width - 1 downTo width * 2 / 3) {
-                if (isGridLineColor(bitmap.getPixel(x, y))) {
-                    rightCandidates.add(x)
-                    break
-                }
+            for (x in rightStart until width) {
+                if (isGridLineColor(bitmap.getPixel(x, y))) rightHits[x - rightStart]++
             }
         }
 
-        if (leftCandidates.isEmpty() || rightCandidates.isEmpty()) return null
+        // 左边界：命中次数最多的列（众数）= 左格线所在列
+        val leftBound = leftHits.indices.maxByOrNull { leftHits[it] }
+            ?.takeIf { leftHits[it] > 0 } ?: return null
 
-        // 取中位数，过滤掉异常值
-        leftCandidates.sort()
-        rightCandidates.sort()
-        val leftBound = leftCandidates[leftCandidates.size / 2]
-        val rightBound = rightCandidates[rightCandidates.size / 2]
+        // 右边界：命中次数最多的列（众数）= 右格线所在列（需加偏移还原绝对坐标）
+        val rightBound = rightHits.indices.maxByOrNull { rightHits[it] }
+            ?.let { it + rightStart }
+            ?.takeIf { rightHits[it - rightStart] > 0 } ?: return null
 
         // 合理性检查：精确边界应在粗裁剪范围内且面积合理
         if (rightBound - leftBound < width / 2 || bottomBound - topBound < height / 2) {
@@ -424,7 +482,16 @@ class ChessBoardAnalyzer(context: Context) {
         return r in 150..245 && g in 110..210 && b in 50..160 && r > g && g > b
     }
 
+    /**
+     * 清空格线边界缓存，在换局/换棋盘时调用，强制下次重新检测格线位置
+     */
+    fun resetGridCache() {
+        cachedPreciseRegion = null
+        Log.d(TAG, "Grid boundary cache cleared")
+    }
+
     fun close() {
+        cachedPreciseRegion = null
         detector.close()
     }
 }
