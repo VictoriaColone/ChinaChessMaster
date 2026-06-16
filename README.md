@@ -151,13 +151,49 @@ app/src/main/jniLibs/arm64-v8a/
 | **引擎启动** | 引擎 `.so` 由系统安装至 `nativeLibraryDir`，通过 `sh -c 'ulimit -s unlimited; engine'` 启动，解除栈大小限制以支持 NNUE 64MB 内存分配 |
 | **UCI 通信** | `position fen <FEN>` → `go movetime 3000` → 解析 `bestmove <ICCS>` |
 | **走法转换** | `PikafishMoveConverter` 将 ICCS 坐标（如 `h0f1`）直接映射为内部坐标（ICCS 行0 = 红方底线 = 内部 row=0），并从 FEN 解析棋子颜色，生成"红馬二进1"格式记谱 |
-| **选项配置** | `NumaPolicy none`（禁用 NUMA 共享内存，避免 Android 兼容性问题）、`Threads 2`、`Hash 32MB` |
+| **选项配置** | `NumaPolicy none`（禁用 NUMA 共享内存，避免 Android 兼容性问题）；`Threads` 与 `Hash` 根据设备实际情况动态设置（见下文） |
 
 **ICCS 坐标系**：列 a-i → 0-8，行 0 = 红方底线，行 9 = 黑方底线，与内部坐标完全一致无需转换。
 
-### 6. 大模型策略分析（降级兜底）
+**动态引擎配置（`PikafishEngine.kt`）**：
 
-Pikafish 引擎不可用时，将识别结果转化为结构化棋盘文本描述，发送至 **DeepSeek API** 获取走法建议。支持通过 `model_config.json` 灵活切换不同 LLM 后端。Toast 提示中会显示走法来源（`PikaFish 提示：` / `DeepSeek 提示：`）。
+| 配置项 | 计算策略 | 范围限制 |
+|--------|---------|---------|
+| **Threads** | `availableProcessors / 2` | `[1, 4]` |
+| **Hash (MB)** | `availableMemory / 10` | `[16, 256]` |
+
+引擎启动时会根据 `Runtime.getRuntime().availableProcessors()` 与 `ActivityManager.getMemoryInfo()` 自动计算最优参数，并在日志中输出 `CPU cores: X, threads: Y, hash: ZMB` 便于调试验证。
+
+### 6. 执方自动判断
+
+`ChessBoardAnalyzer` 在组装棋子列表后，根据**帅/将的屏幕行位置**自动推断用户执哪方：
+
+- **帅在下半区（row ≥ 5）** → 用户执红，推荐红方最佳走法
+- **将在下半区（row ≥ 5）** → 用户执黑，推荐黑方最佳走法
+
+判断结果（`userColor: "红"/"黑"`）贯穿整条链路：FEN 轮次字段（`w`/`b`）、Pikafish 引擎分析、DeepSeek Prompt 均以此为准，确保始终给出**用户当前执方**的最佳着子方案。
+
+### 7. 棋局合法性过滤（`ChessBoardAnalyzer.filterIllegalPieces()`）
+
+YOLOX 可能在背景噪声处产生幻觉误检，过滤规则：
+
+1. **同格重复**：同一格子出现多个棋子时，保留置信度最高的一个
+2. **超数量限制**：按象棋规则对每类棋子设上限（帅/将各 1、仕/士各 2、相/象各 2、車各 2、馬各 2、炮各 2、兵/卒各 5），超出时保留置信度最高的若干个
+
+过滤在 `analyzeScreenshot()` 中、FEN 生成之前执行。
+
+### 8. 走法记谱术语
+
+`PikafishMoveConverter` 将 ICCS 坐标转换为中文记谱，列号方向规则：
+
+| 执方 | 列号方向 | 示例 |
+|------|---------|------|
+| **红方** | 从右到左，汉字大写一～九 | 馬二进三 |
+| **黑方** | 从右到左，阿拉伯数字 1～9（col=8→1，col=0→9） | 马８进６ |
+
+### 9. 大模型策略分析（降级兜底）
+
+Pikafish 引擎不可用时，将识别结果转化为结构化棋盘文本描述，发送至 **DeepSeek API** 获取走法建议。`LlmApiClient.buildSystemPrompt(userColor)` 会根据执方动态生成 Prompt，要求模型仅分析该方的最佳走法。支持通过 `model_config.json` 灵活切换不同 LLM 后端。Toast 提示中会显示走法来源（`PikaFish 提示：` / `DeepSeek 提示：`）。
 
 ---
 

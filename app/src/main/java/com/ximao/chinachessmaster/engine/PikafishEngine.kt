@@ -212,7 +212,33 @@ class PikafishEngine(private val context: Context) {
     }
 
     /**
+     * 根据设备实际情况计算最优线程数：
+     * - 取物理核心数（大核）的一半，保留系统开销，最少 1 最多 4
+     * - Android 上多线程 NNUE 每线程分配 64MB，线程过多易 Segfault 或 OOM
+     */
+    private fun optimalThreadCount(): Int {
+        val cpuCount = Runtime.getRuntime().availableProcessors()
+        // 取一半核心，避免抢占系统资源，上限 4（NNUE 每线程 64MB）
+        return (cpuCount / 2).coerceIn(1, 4)
+    }
+
+    /**
+     * 根据设备可用内存计算最优哈希表大小（MB）：
+     * - 取可用内存的 10%，最少 16MB，最多 256MB
+     * - 哈希表过大会触发 OOM，过小影响搜索深度
+     */
+    private fun optimalHashSizeMb(): Int {
+        val activityManager = context.getSystemService(android.app.ActivityManager::class.java)
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        val availableMb = memInfo.availMem / 1024 / 1024
+        // 取可用内存的 10%
+        return (availableMb / 10).toInt().coerceIn(16, 256)
+    }
+
+    /**
      * UCI 握手：uci → setoption → isready → readyok
+     * 线程数和哈希表大小根据设备实际情况动态设置
      */
     private fun performUciHandshake(nnuePath: String): Boolean {
         sendCommand("uci")
@@ -221,10 +247,14 @@ class PikafishEngine(private val context: Context) {
             return false
         }
 
+        val threads = optimalThreadCount()
+        val hashMb = optimalHashSizeMb()
+        Log.d(TAG, "Device config → CPU cores: ${Runtime.getRuntime().availableProcessors()}, threads: $threads, hash: ${hashMb}MB")
+
         sendCommand("setoption name EvalFile value $nnuePath")
         sendCommand("setoption name NumaPolicy value none")  // 禁用 NUMA/共享内存，避免 Android SELinux 下 Segfault
-        sendCommand("setoption name Threads value 1")        // 单线程，彻底消除多线程 NNUE 内存竞争导致的 Segfault
-        sendCommand("setoption name Hash value 16")
+        sendCommand("setoption name Threads value $threads")
+        sendCommand("setoption name Hash value $hashMb")
         sendCommand("isready")
 
         if (!readUntil("readyok")) {
